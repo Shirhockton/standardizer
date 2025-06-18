@@ -1,14 +1,21 @@
 package controllers
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"standardizer/global"
+	"standardizer/utils"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/xuri/excelize/v2"
+
+	"standardizer/models"
 )
 
 func GetResponse(ctx *gin.Context) {
@@ -28,13 +35,24 @@ func GetResponse(ctx *gin.Context) {
 
 	// 检查文件是否存在
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		slog.Error("文件不存在", "file", filePath)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "文件不存在"})
 		return
 	}
+	md5Low32 := utils.CalcMd5(filePath)
+	// 检查文件报告是否已在数据库中，若在，则直接返回报告
+	var reportModel models.Report
+	if err := global.Db.Where("md5_low32 = ?", md5Low32).First(&reportModel).Error; err == nil {
+		slog.Info("文件报告已存在于数据库", "file", filePath)
+		ctx.JSON(http.StatusOK, reportModel)
+		return
+	}
 
+	// 分析文件
 	analyzer := global.CodeAnalyzer
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
+		slog.Error("获取文件信息失败", "error", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "获取文件信息失败"})
 		return
 	}
@@ -63,14 +81,180 @@ func GetResponse(ctx *gin.Context) {
 	}
 
 	// 检查 Ollama LLM 是否启动
-	req := httptest.NewRequest("GET", "http://localhost:11434/api/tags", nil)
+	// 使用 http.NewRequest 替代 httptest.NewRequest
+	req, err := http.NewRequest("GET", "http://localhost:11434/api/tags", nil)
+	if err != nil {
+		slog.Error("创建请求失败", "error", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		return
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
+		slog.Error("Ollama LLM 未启动")
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Ollama LLM 未启动"})
 		return
 	}
+	report := analyzer.GenerateReport(filePath)
 
-	// 步骤2: 生成报告
-	report := analyzer.GenerateReport()
+	SaveExcelReport(report)
+
+	saveReportInDB(ctx, filePath, report)
+
 	ctx.JSON(http.StatusOK, report)
+}
+
+// 保存 Excel 文件
+func SaveExcelReport(report map[string]interface{}) {
+	slog.Info("开始保存Excel报告")
+	// 提取第一个文件路径作为文件名基础
+	// var baseFileName string
+	// for file := range c.Results {
+	// 	baseFileName = file
+	// 	break
+	// }
+	// if baseFileName == "" {
+	// 	baseFileName = "default"
+	// }
+
+	// // 提取文件名并去掉扩展名
+	// lastSlash := strings.LastIndex(baseFileName, "\\")
+	// if lastSlash == -1 {
+	// 	lastSlash = 0
+	// }
+	// lastDot := strings.LastIndex(baseFileName[lastSlash+1:], ".")
+	// if lastDot == -1 {
+	// 	lastDot = len(baseFileName[lastSlash+1:])
+	// }
+	// fileName := baseFileName[lastSlash+1 : lastSlash+1+lastDot]
+
+	// 构建完整文件路径
+	dir := "results"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		slog.Error("创建结果目录失败", "error", err)
+		// fmt.Printf("创建结果目录失败: %v\n", err)
+		return
+	}
+	fullPath := filepath.Join(dir, fmt.Sprintf("%s_result.xlsx", report["file-name"]))
+
+	f := excelize.NewFile()
+	sheetName := "CodeAnalysisReport"
+	index, err := f.NewSheet(sheetName)
+	if err != nil {
+		slog.Error("创建 Excel 工作表失败", "error", err)
+		// fmt.Printf("创建 Excel 工作表失败: %v\n", err)
+		return
+	}
+	f.SetActiveSheet(index)
+
+	// 设置表头
+	headers := []string{"文件", "行号", "规则", "问题描述", "建议修正"}
+	for colIndex, header := range headers {
+		cell, _ := excelize.CoordinatesToCellName(colIndex+1, 1)
+		f.SetCellValue(sheetName, cell, header)
+	}
+
+	row := 2
+	for _, issue := range report["issues"].([]map[string]interface{}) {
+		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), issue["file"])
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), issue["line"])
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), issue["rule"])
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), issue["original"])
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), issue["suggested"])
+		row++
+	}
+
+	// 保存 Excel 文件
+	if err := f.SaveAs(fullPath); err != nil {
+		slog.Error("保存 Excel 报告失败", "file", fullPath, "error", err)
+		// fmt.Printf("保存 Excel 报告失败: %v\n", err)
+	} else {
+		slog.Info("Excel 报告已生成", "file", fullPath)
+	}
+	slog.Info(" 总计:", report["total_files"], "个文件", report["total_issues"], "处问题")
+	fmt.Printf("\n=== 总计: %d个文件, %d处问题 ===\n", report["total_files"], report["total_issues"])
+	// fmt.Printf("Excel 报告已生成: %s\n", fullPath)
+}
+
+// 新增下载报告接口
+func DownloadReport(ctx *gin.Context) {
+	// 从请求头获取报告文件名
+	fileName := ctx.GetHeader("File-Name")
+	if fileName == "" {
+		slog.Error("未提供文件名")
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "未提供文件名"})
+		return
+	}
+
+	// 构建报告文件路径
+	lastDot := strings.LastIndex(fileName, ".")
+	if lastDot == -1 {
+		lastDot = len(fileName)
+	}
+	fileName = fileName[:lastDot]
+	reportName := fileName + "_result.xlsx"
+	reportDir := filepath.Join(".", "results")
+	reportPath := filepath.Join(reportDir, reportName)
+
+	// 检查报告文件是否存在
+	if _, err := os.Stat(reportPath); os.IsNotExist(err) {
+		slog.Error("报告文件不存在")
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "报告文件不存在"})
+		return
+	}
+
+	// 设置响应头
+	ctx.Header("Content-Description", "File Transfer")
+	ctx.Header("Content-Type", "application/octet-stream")
+	ctx.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", reportName))
+	ctx.Header("Content-Transfer-Encoding", "binary")
+	ctx.Header("Expires", "0")
+	ctx.Header("Cache-Control", "must-revalidate")
+	ctx.Header("Pragma", "public")
+	ctx.Header("File-Name", reportName)
+
+	// 发送文件
+	ctx.File(reportPath)
+}
+
+func saveReportInDB(ctx *gin.Context, filePath string, report map[string]interface{}) {
+	// filePath := c.PostForm("filePath")
+	// 假设这里有生成报告内容的逻辑
+	// 	// reportContent := generateReport(filePath)
+
+	// 读取文件，计算文件内容的 MD5 低 32 位
+	file, err := os.Open(filePath)
+	if err != nil {
+		slog.Error("打开文件失败", "error", err)
+		return
+	}
+	defer file.Close()
+
+	// 计算文件 MD5
+	md5Low32 := utils.CalcMd5(filePath)
+
+	// 转换报告内容为 JSON 字符串
+	reportJSON, err := json.Marshal(report)
+	if err != nil {
+		slog.Error("报告内容转换为 JSON 失败", "error", err)
+		// fmt.Printf("报告内容转换为 JSON 失败: %v\n", err)
+		return
+	}
+
+	// 创建 Report 实例
+	reportModel := models.Report{
+		MD5Low32:  md5Low32,
+		Content:   string(reportJSON),
+		CreatedAt: time.Now(),
+	}
+
+	// 保存报告到数据库
+	if err := global.Db.AutoMigrate(&models.Report{}); err != nil {
+		slog.Error("自动迁移数据库失败", "error", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := global.Db.Create(&reportModel).Error; err != nil {
+		slog.Error("保存报告到数据库失败", "error", err)
+		return
+	}
 }

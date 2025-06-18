@@ -3,8 +3,8 @@ package models
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
-	"path/filepath"
 	"regexp"
 
 	// "standardizer/global"
@@ -13,7 +13,6 @@ import (
 	"sync"
 
 	"github.com/tmc/langchaingo/llms"
-	"github.com/xuri/excelize/v2"
 )
 
 // 代码分析结构体
@@ -36,40 +35,48 @@ type Issue struct {
 
 // 处理单个文件
 func (c *CodeAnalyzer) ProcessFile(path string) error {
+	slog.Info("开始处理文件", "file", path)
 
 	// 只处理C++文件
 	if !strings.HasSuffix(path, ".cpp") && !strings.HasSuffix(path, ".h") && !strings.HasSuffix(path, ".hpp") {
+		slog.Debug("跳过非C++文件", "file", path)
 		return nil
 	}
 
 	content, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("读取文件失败 %s: %v\n", path, err)
+		slog.Error("读取文件失败", "file", path, "error", err)
+		// fmt.Printf("读取文件失败 %s: %v\n", path, err)
 		return nil
 	}
 
 	// 分块处理大文件
 	chunks := utils.SplitCodeIntoChunks(string(content), 500) // 500行/块
+	slog.Debug("文件分块完成", "file", path, "chunk_count", len(chunks))
 
 	for i, chunk := range chunks {
 		startLine := i * 500
 		c.analyzeCodeChunk(path, chunk, startLine)
 	}
 
+	slog.Info("文件处理完成", "file", path)
 	return nil
 }
 
 // 分析代码块
 func (c *CodeAnalyzer) analyzeCodeChunk(filePath, code string, startLine int) {
+	slog.Info("开始分析代码块", "file", filePath, "start_line", startLine)
 	// 构造LLM提示
 	prompt := c.buildPrompt(code)
 
 	// 调用LLM
 	response, err := c.Llm.Call(c.Ctx, prompt)
 	if err != nil {
-		fmt.Printf("LLM分析失败 %s: %v\n", filePath, err)
+		slog.Error("LLM分析失败", "file", filePath, "error", err)
+		// fmt.Printf("LLM分析失败 %s: %v\n", filePath, err)
 		return
 	}
+	slog.Debug("LLM分析成功", "file", filePath)
 
 	// 解析响应
 	issues := parseLLMResponse(response, filePath, startLine)
@@ -78,6 +85,7 @@ func (c *CodeAnalyzer) analyzeCodeChunk(filePath, code string, startLine int) {
 	c.Mu.Lock()
 	c.Results[filePath] = append(c.Results[filePath], issues...)
 	c.Mu.Unlock()
+	slog.Debug("结果存储完成", "file", filePath, "issue_count", len(issues))
 }
 
 // 构建LLM提示
@@ -99,8 +107,22 @@ func (c *CodeAnalyzer) buildPrompt(code string) string {
 }
 
 // 生成报告
-func (c *CodeAnalyzer) GenerateReport() map[string]interface{} {
+func (c *CodeAnalyzer) GenerateReport(path string) map[string]interface{} {
+	slog.Info("开始生成报告")
+
+	// 提取文件名并去掉扩展名
+	lastSlash := strings.LastIndex(path, "\\")
+	if lastSlash == -1 {
+		lastSlash = 0
+	}
+	lastDot := strings.LastIndex(path[lastSlash+1:], ".")
+	if lastDot == -1 {
+		lastDot = len(path[lastSlash+1:])
+	}
+	fileName := path[lastSlash+1 : lastSlash+1+lastDot]
+
 	report := make(map[string]interface{})
+	report["file-name"] = fileName
 	report["title"] = "代码规范检查报告"
 	report["rule_count"] = len(c.Rules)
 
@@ -123,78 +145,14 @@ func (c *CodeAnalyzer) GenerateReport() map[string]interface{} {
 	report["total_files"] = len(c.Results)
 	report["total_issues"] = totalIssues
 	report["issues"] = issues
-	c.SaveExcelReport(report)
+	// c.SaveExcelReport(report)
+	slog.Info("报告生成完成", "total_files", report["total_files"], "total_issues", report["total_issues"])
 	return report
-}
-
-// 保存 Excel 文件
-func (c *CodeAnalyzer) SaveExcelReport(report map[string]interface{}) {
-	// 提取第一个文件路径作为文件名基础
-	var baseFileName string
-	for file := range c.Results {
-		baseFileName = file
-		break
-	}
-	if baseFileName == "" {
-		baseFileName = "default"
-	}
-
-	// 提取文件名并去掉扩展名
-	lastSlash := strings.LastIndex(baseFileName, "\\")
-	if lastSlash == -1 {
-		lastSlash = 0
-	}
-	lastDot := strings.LastIndex(baseFileName[lastSlash+1:], ".")
-	if lastDot == -1 {
-		lastDot = len(baseFileName[lastSlash+1:])
-	}
-	fileName := baseFileName[lastSlash+1 : lastSlash+1+lastDot]
-
-	// 构建完整文件路径
-	dir := "results"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Printf("创建结果目录失败: %v\n", err)
-		return
-	}
-	fullPath := filepath.Join(dir, fmt.Sprintf("%s_result.xlsx", fileName))
-
-	f := excelize.NewFile()
-	sheetName := "CodeAnalysisReport"
-	index, err := f.NewSheet(sheetName)
-	if err != nil {
-		fmt.Printf("创建 Excel 工作表失败: %v\n", err)
-		return
-	}
-	f.SetActiveSheet(index)
-
-	// 设置表头
-	headers := []string{"文件", "行号", "规则", "问题描述", "建议修正"}
-	for colIndex, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(colIndex+1, 1)
-		f.SetCellValue(sheetName, cell, header)
-	}
-
-	row := 2
-	for _, issue := range report["issues"].([]map[string]interface{}) {
-		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), issue["file"])
-		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), issue["line"])
-		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), issue["rule"])
-		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), issue["original"])
-		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), issue["suggested"])
-		row++
-	}
-
-	// 保存 Excel 文件
-	if err := f.SaveAs(fullPath); err != nil {
-		fmt.Printf("保存 Excel 报告失败: %v\n", err)
-	}
-
-	fmt.Printf("\n=== 总计: %d个文件, %d处问题 ===\n", report["total_files"], report["total_issues"])
-	fmt.Printf("Excel 报告已生成: %s\n", fullPath)
 }
 
 // 解析LLM响应
 func parseLLMResponse(response, filePath string, startLine int) []Issue {
+	slog.Debug("开始解析LLM响应", "file", filePath)
 	var issues []Issue
 
 	lines := strings.Split(response, "\n")
@@ -219,6 +177,7 @@ func parseLLMResponse(response, filePath string, startLine int) []Issue {
 			Suggested: matches[4],
 		})
 	}
+	slog.Debug("LLM响应解析完成", "file", filePath, "issue_count", len(issues))
 	return issues
 }
 

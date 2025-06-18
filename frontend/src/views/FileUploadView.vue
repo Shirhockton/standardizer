@@ -3,6 +3,7 @@
     <input type="file" @change="handleFileChange" class="file-input" />
     <button @click="uploadFile" class="btn btn-primary">上传文件</button>
     <button @click="startScan" class="btn btn-secondary">开始扫描</button>
+    <button @click="downloadReport" class="btn btn-success">报告下载</button>
     <div v-if="uploadStatus" class="status-message">{{ uploadStatus }}</div>
     <div v-if="scanStatus" class="status-message">{{ scanStatus }}</div>
   </div>
@@ -77,6 +78,40 @@ const startScan = async () => {
     console.error('Failed to scan:', error);
   }
 };
+
+const downloadReport = async () => {
+  if (!selectedFile.value) {
+    scanStatus.value = '请先选择文件';
+    return;
+  }
+
+  try {
+    const response = await fetch('api/api/download-report', {
+      method: 'GET',
+      headers: {
+        'Authorization': `${authStore.token}`,
+        'File-Name': selectedFile.value.name
+      }
+    });
+
+    if (response.ok) {
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = response.headers.get('File-Name')||"report.xlsx";
+      // a.download = `report_${selectedFile.value.name}`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      scanStatus.value = '报告下载成功';
+    } else {
+      scanStatus.value = `报告下载失败，状态码: ${response.status}`;
+    }
+  } catch (error) {
+    console.error('Failed to download report:', error);
+    scanStatus.value = '下载报告时出现错误';
+  }
+};
 </script>
 
 <style scoped>
@@ -110,6 +145,11 @@ const startScan = async () => {
 
 .btn-secondary {
   background-color: #67C23A;
+  color: white;
+}
+
+.btn-success {
+  background-color: #E6A23C;
   color: white;
 }
 

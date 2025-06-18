@@ -1,7 +1,10 @@
 package utils
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
+	"os"
 	"strings"
 	"time"
 
@@ -80,4 +83,14 @@ func Atoi(s string) int {
 		i = i*10 + int(r-'0')
 	}
 	return i
+}
+
+func CalcMd5(path string) string {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	md5Hash := md5.Sum(content)
+	md5Low32 := hex.EncodeToString(md5Hash[:])[:32]
+	return md5Low32
 }
