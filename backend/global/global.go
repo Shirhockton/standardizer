@@ -5,6 +5,7 @@ import (
 	"standardizer/models"
 
 	"github.com/go-redis/redis"
+	"github.com/streadway/amqp"
 	"github.com/tmc/langchaingo/llms/ollama"
 	"gorm.io/gorm"
 )
@@ -15,4 +16,5 @@ var (
 	LLM          *ollama.LLM
 	CodeAnalyzer *models.CodeAnalyzer
 	Ctx          context.Context
+	RabbitMQConn *amqp.Connection
 )

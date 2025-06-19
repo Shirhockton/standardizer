@@ -40,4 +40,5 @@ func InitConfig() {
 	initDB()
 	InitRedis()
 	InitLLM()
+	InitRabbitMQ("amqp://guest:guest@localhost:5672/")
 }
