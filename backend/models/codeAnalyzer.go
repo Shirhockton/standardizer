@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
-
-	// "standardizer/global"
 	"standardizer/utils"
 	"strings"
 	"sync"
@@ -46,8 +45,7 @@ func (c *CodeAnalyzer) ProcessFile(path string) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		slog.Error("读取文件失败", "file", path, "error", err)
-		// fmt.Printf("读取文件失败 %s: %v\n", path, err)
-		return nil
+		return err
 	}
 
 	// 分块处理大文件
@@ -73,7 +71,6 @@ func (c *CodeAnalyzer) analyzeCodeChunk(filePath, code string, startLine int) {
 	response, err := c.Llm.Call(c.Ctx, prompt)
 	if err != nil {
 		slog.Error("LLM分析失败", "file", filePath, "error", err)
-		// fmt.Printf("LLM分析失败 %s: %v\n", filePath, err)
 		return
 	}
 	slog.Debug("LLM分析成功", "file", filePath)
@@ -103,23 +100,21 @@ func (c *CodeAnalyzer) buildPrompt(code string) string {
 3. 示例：
    42:规则2:危险的类型转换:使用static_cast<int>(value)代替(int)value
 
-请开始分析：`, rulesStr, code)
+请开始分析：%s`, rulesStr, code)
+}
+
+// 提取文件名并去掉扩展名
+func extractFileName(path string) string {
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext)
 }
 
 // 生成报告
 func (c *CodeAnalyzer) GenerateReport(path string) map[string]interface{} {
 	slog.Info("开始生成报告")
 
-	// 提取文件名并去掉扩展名
-	lastSlash := strings.LastIndex(path, "\\")
-	if lastSlash == -1 {
-		lastSlash = 0
-	}
-	lastDot := strings.LastIndex(path[lastSlash+1:], ".")
-	if lastDot == -1 {
-		lastDot = len(path[lastSlash+1:])
-	}
-	fileName := path[lastSlash+1 : lastSlash+1+lastDot]
+	fileName := extractFileName(path)
 
 	report := make(map[string]interface{})
 	report["file-name"] = fileName
@@ -145,7 +140,7 @@ func (c *CodeAnalyzer) GenerateReport(path string) map[string]interface{} {
 	report["total_files"] = len(c.Results)
 	report["total_issues"] = totalIssues
 	report["issues"] = issues
-	// c.SaveExcelReport(report)
+
 	slog.Info("报告生成完成", "total_files", report["total_files"], "total_issues", report["total_issues"])
 	return report
 }
@@ -184,21 +179,3 @@ func parseLLMResponse(response, filePath string, startLine int) []Issue {
 func (c *CodeAnalyzer) ClearAnalyzerResults() {
 	c.Results = make(map[string][]Issue)
 }
-
-// func GetResponse(ctx *gin.Context) {
-// 	// 设置工程路径
-// 	projectPath := "./sample_project"
-// 	analyzer := global.CodeAnalyzer
-// 	// 步骤1: 遍历C++工程
-// 	if err := filepath.Walk(projectPath, analyzer.ProcessFile); err != nil {
-// 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("遍历工程失败: %v", err)})
-// 		return
-// 	}
-
-// 	// 步骤2: 生成报告
-// 	report := analyzer.GenerateReport()
-// 	ctx.JSON(http.StatusOK, report)
-
-// 	// 步骤3: 保存 Excel 报告
-// 	go analyzer.SaveExcelReport()
-// }

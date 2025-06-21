@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"log"
+	"standardizer/consumer"
 	"standardizer/global"
 
 	"github.com/spf13/viper"
@@ -41,4 +42,5 @@ func InitConfig() {
 	InitRedis()
 	InitLLM()
 	InitRabbitMQ("amqp://guest:guest@localhost:5672/")
+	consumer.StartConsumer()
 }

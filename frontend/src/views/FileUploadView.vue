@@ -10,12 +10,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { onUnmounted, ref } from 'vue';
 import { useAuthStore } from '../store/auth';
 
 const selectedFile = ref<File | null>(null);
 const uploadStatus = ref('');
 const scanStatus = ref('');
+let pollInterval: NodeJS.Timeout | null = null; // 用于存储轮询定时器
 
 const handleFileChange = (event: Event) => {
   const target = event.target as HTMLInputElement;
@@ -70,7 +71,34 @@ const startScan = async () => {
     });
 
     if (response.ok) {
-      scanStatus.value = '扫描成功';
+      const data = await response.json();
+      if (response.status === 200) {
+        scanStatus.value = '扫描成功';
+        // 可以在这里处理扫描结果
+      } else if (response.status === 202) {
+        scanStatus.value = '文件扫描任务已接收，请稍后...';
+        const md5Low32 = data.md5_low32;
+        // 启动轮询
+        pollInterval = setInterval(async () => {
+          const pollResponse = await fetch(`api/api/check-report?md5_low32=${md5Low32}`, {
+            method: 'GET',
+            headers: {
+              'Authorization': `${authStore.token}`
+            }
+          });
+
+          if (pollResponse.ok) {
+            const pollData = await pollResponse.json();
+            if (pollResponse.status === 200) {
+              scanStatus.value = '扫描成功';
+              // 可以在这里处理扫描结果
+              clearInterval(pollInterval as NodeJS.Timeout);
+            }
+          } else {
+            // 报告尚未生成，继续轮询
+          }
+        }, 5000);
+      }
     } else {
       scanStatus.value = `扫描失败，状态码: ${response.status}`;
     }
@@ -112,6 +140,13 @@ const downloadReport = async () => {
     scanStatus.value = '下载报告时出现错误';
   }
 };
+
+// 组件卸载时清除定时器
+onUnmounted(() => {
+  if (pollInterval) {
+    clearInterval(pollInterval);
+  }
+});
 </script>
 
 <style scoped>

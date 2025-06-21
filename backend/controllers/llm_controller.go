@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,18 +9,15 @@ import (
 	"standardizer/global"
 	"standardizer/utils"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/streadway/amqp"
 	"github.com/xuri/excelize/v2"
 
 	"standardizer/models"
 )
 
 func GetResponse(ctx *gin.Context) {
-	// 清空分析结果
-	global.CodeAnalyzer.ClearAnalyzerResults()
-
 	// 从请求头获取文件名
 	fileName := ctx.GetHeader("File-Name")
 	if fileName == "" {
@@ -48,59 +44,47 @@ func GetResponse(ctx *gin.Context) {
 		return
 	}
 
-	// 分析文件
-	analyzer := global.CodeAnalyzer
-	fileInfo, err := os.Stat(filePath)
+	// 若数据库中无报告，将任务发布到消息队列
+	ch, err := global.RabbitMQConn.Channel()
 	if err != nil {
-		slog.Error("获取文件信息失败", "error", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "获取文件信息失败"})
+		slog.Error("打开 RabbitMQ 通道失败", "error", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "无法连接到消息队列"})
+		return
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"file_scan_queue", // 队列名称
+		true,              // 持久化
+		false,             // 自动删除
+		false,             // 排他
+		false,             // 等待服务器响应
+		nil,               // 额外参数
+	)
+	if err != nil {
+		slog.Error("声明 RabbitMQ 队列失败", "error", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "无法声明消息队列"})
 		return
 	}
 
-	if fileInfo.IsDir() {
-		// 处理目录
-		err := filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				return analyzer.ProcessFile(path)
-			}
-			return nil
+	err = ch.Publish(
+		"",     // 交换器
+		q.Name, // 路由键
+		false,  // 强制
+		false,  // 立即
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "text/plain",
+			Body:         []byte(filePath),
 		})
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("遍历目录失败: %v", err)})
-			return
-		}
-	} else {
-		// 处理单个文件
-		if err := analyzer.ProcessFile(filePath); err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("处理文件失败: %v", err)})
-			return
-		}
-	}
-
-	// 检查 Ollama LLM 是否启动
-	// 使用 http.NewRequest 替代 httptest.NewRequest
-	req, err := http.NewRequest("GET", "http://localhost:11434/api/tags", nil)
 	if err != nil {
-		slog.Error("创建请求失败", "error", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		slog.Error("发布消息到 RabbitMQ 失败", "error", err)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "无法发布扫描任务"})
 		return
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		slog.Error("Ollama LLM 未启动")
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Ollama LLM 未启动"})
-		return
-	}
-	report := analyzer.GenerateReport(filePath)
 
-	SaveExcelReport(report)
-
-	saveReportInDB(ctx, filePath, report)
-
-	ctx.JSON(http.StatusOK, report)
+	// 返回任务已接收状态
+	ctx.JSON(http.StatusAccepted, gin.H{"message": "文件扫描任务已接收，请稍后查询结果", "md5_low32": md5Low32})
 }
 
 // 保存 Excel 文件
@@ -216,45 +200,60 @@ func DownloadReport(ctx *gin.Context) {
 	ctx.File(reportPath)
 }
 
-func saveReportInDB(ctx *gin.Context, filePath string, report map[string]interface{}) {
-	// filePath := c.PostForm("filePath")
-	// 假设这里有生成报告内容的逻辑
-	// 	// reportContent := generateReport(filePath)
-
-	// 读取文件，计算文件内容的 MD5 低 32 位
-	file, err := os.Open(filePath)
+// ProcessFileOrDirectory 处理文件或目录的逻辑
+func ProcessFileOrDirectory(filePath string, analyzer *models.CodeAnalyzer) error {
+	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		slog.Error("打开文件失败", "error", err)
-		return
+		slog.Error("获取文件信息失败", "error", err)
+		return err
 	}
-	defer file.Close()
 
-	// 计算文件 MD5
-	md5Low32 := utils.CalcMd5(filePath)
+	if fileInfo.IsDir() {
+		// 处理目录
+		err := filepath.Walk(filePath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				return analyzer.ProcessFile(path)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("遍历目录失败: %w", err)
+		}
+	} else {
+		// 处理单个文件
+		if err := analyzer.ProcessFile(filePath); err != nil {
+			return fmt.Errorf("处理文件失败: %w", err)
+		}
+	}
 
-	// 转换报告内容为 JSON 字符串
-	reportJSON, err := json.Marshal(report)
+	// 检查 Ollama LLM 是否启动
+	req, err := http.NewRequest("GET", "http://localhost:11434/api/tags", nil)
 	if err != nil {
-		slog.Error("报告内容转换为 JSON 失败", "error", err)
-		// fmt.Printf("报告内容转换为 JSON 失败: %v\n", err)
+		slog.Error("创建请求失败", "error", err)
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		slog.Error("Ollama LLM 未启动")
+		return fmt.Errorf("Ollama LLM 未启动")
+	}
+	return nil
+}
+
+func CheckReport(ctx *gin.Context) {
+	md5Low32 := ctx.Query("md5_low32")
+	if md5Low32 == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "未提供 md5_low32"})
 		return
 	}
 
-	// 创建 Report 实例
-	reportModel := models.Report{
-		MD5Low32:  md5Low32,
-		Content:   string(reportJSON),
-		CreatedAt: time.Now(),
-	}
-
-	// 保存报告到数据库
-	if err := global.Db.AutoMigrate(&models.Report{}); err != nil {
-		slog.Error("自动迁移数据库失败", "error", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if err := global.Db.Create(&reportModel).Error; err != nil {
-		slog.Error("保存报告到数据库失败", "error", err)
-		return
+	var reportModel models.Report
+	if err := global.Db.Where("md5_low32 = ?", md5Low32).First(&reportModel).Error; err == nil {
+		ctx.JSON(http.StatusOK, reportModel)
+	} else {
+		ctx.JSON(http.StatusNotFound, gin.H{"error": "报告尚未生成"})
 	}
 }
